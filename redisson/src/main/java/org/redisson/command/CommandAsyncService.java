@@ -558,6 +558,7 @@ public class CommandAsyncService implements CommandAsyncExecutor {
             args.addAll(keys);
             args.addAll(Arrays.asList(params));
 
+            // MEMO: 레디스 서버에 요청 보내는 부분
             RedisExecutor<T, R> executor = new RedisExecutor(readOnlyMode, nodeSource, codec, cmd,
                     args.toArray(), promise, false,
                     connectionManager, objectBuilder, referenceType, noRetry,
@@ -571,6 +572,7 @@ public class CommandAsyncService implements CommandAsyncExecutor {
                         RFuture<R> future = evalAsync(nodeSource, readOnlyMode, codec, evalCommandType, mappedScript, keysCopy, noRetry, paramsCopy);
                         transfer(future.toCompletableFuture(), mainPromise);
                     } else if (e.getMessage().startsWith("NOSCRIPT")) {
+                        // MEMO: 스크립트를 다시 Redis에 로드한 후 다시 실행
                         RFuture<String> loadFuture = loadScript(executor.getRedisClient(), mappedScript);
                         loadFuture.whenComplete((r, ex) -> {
                             if (ex != null) {

@@ -106,6 +106,8 @@ abstract class PublishSubscribe<E extends PubSubEntry<E>> {
                 return;
             }
 
+            // Redis 채널에 대해 메시지를 수신할 리스너를 생성하고 등록
+            // 이 리스너는 락 해제 메시지가 올 때 동작하게 됨
             RedisPubSubListener<Object> listener = createListener(channelName, value);
             CompletableFuture<PubSubConnectionEntry> s = service.subscribeNoTimeout(LongCodec.INSTANCE, channelName, semaphore, listener);
             newPromise.whenComplete((r, e) -> {

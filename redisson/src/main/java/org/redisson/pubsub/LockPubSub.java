@@ -43,6 +43,7 @@ public class LockPubSub extends PublishSubscribe<RedissonLockEntry> {
         if (message.equals(UNLOCK_MESSAGE)) {
             value.tryRunListener();
 
+            // 이 순간 락을 기다라던 다른 애들이 깨어남
             value.getLatch().release();
         } else if (message.equals(READ_UNLOCK_MESSAGE)) {
             value.tryRunAllListeners();

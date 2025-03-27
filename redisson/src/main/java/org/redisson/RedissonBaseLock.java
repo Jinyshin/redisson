@@ -169,12 +169,13 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
                 throw new CompletionException(e);
             }
             if (res == null) {
+                // nil -> 예외 발생
                 IllegalMonitorStateException cause = new IllegalMonitorStateException("attempt to unlock lock, not locked by current thread by node id: "
                         + id + " thread-id: " + threadId);
                 throw new CompletionException(cause);
             }
 
-            return null;
+            return null; // 락 해제 성공 -> 추가 처리 필요 없음
         });
 
         return new CompletableFutureWrapper<>(f);
@@ -214,17 +215,23 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
 
     protected abstract RFuture<Boolean> unlockInnerAsync(long threadId, String requestId, int timeout);
 
+    // 해당 스레드가 소유한 락을 해제하는 비동기 처리 메서드
     protected final RFuture<Boolean> unlockInnerAsync(long threadId) {
+        // 락 해제 요청을 보낼 때마다 id 생성 -> 이걸 unlock latch key에 활용
         String id = getServiceManager().generateId();
+        // 락 해제 요청의 timeout 계산
         MasterSlaveServersConfig config = getServiceManager().getConfig();
         int timeout = (config.getTimeout() + config.getRetryInterval()) * config.getRetryAttempts();
         timeout = Math.max(timeout, 1);
+        // 내부에서 Lua 스크립트 실행
         RFuture<Boolean> r = unlockInnerAsync(threadId, id, timeout);
         CompletionStage<Boolean> ff = r.thenApply(v -> {
             CommandAsyncExecutor ce = commandExecutor;
             if (ce instanceof CommandBatchService) {
                 ce = new CommandBatchService(commandExecutor);
             }
+
+            // 락 해제 상태를 확인하기 위해 사용하는 임시 키(unlock latch key) 삭제
             ce.writeAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.DEL, getUnlockLatchName(id));
             if (ce instanceof CommandBatchService) {
                 ((CommandBatchService) ce).executeAsync();

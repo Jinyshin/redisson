@@ -95,7 +95,7 @@ public class RedissonLockTest extends BaseConcurrentTest {
         AtomicInteger errors = new AtomicInteger();
         AtomicInteger ops = new AtomicInteger();
         for (int i = 0; i < 5000; i++) {
-            int j = i;
+            int j = i; // MEMO: 왜쓴거임..;;
             e.submit(() -> {
                 try {
                     String lockKey = "lock-" + ThreadLocalRandom.current().nextInt(5);

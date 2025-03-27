@@ -70,10 +70,6 @@ public class RedissonLock extends RedissonBaseLock {
         return prefixName("redisson_lock__channel", getRawName());
     }
 
-    String getUnlockLatchName(String requestId) {
-        return prefixName("redisson_unlock_latch", getRawName()) + ":" + requestId;
-    }
-
     @Override
     public void lock() {
         try {
@@ -103,14 +99,17 @@ public class RedissonLock extends RedissonBaseLock {
         lock(leaseTime, unit, true);
     }
 
+    // public lock(), lock(...) 호출 시 내부적으로 실행되는 메서드
     private void lock(long leaseTime, TimeUnit unit, boolean interruptibly) throws InterruptedException {
         long threadId = Thread.currentThread().getId();
+        // 락 획득 시도
         Long ttl = tryAcquire(-1, leaseTime, unit, threadId);
         // lock acquired
         if (ttl == null) {
             return;
         }
 
+        // 락 획득 실패시 구독!
         CompletableFuture<RedissonLockEntry> future = subscribe(threadId);
         pubSub.timeout(future);
         RedissonLockEntry entry;
@@ -121,6 +120,7 @@ public class RedissonLock extends RedissonBaseLock {
         }
 
         try {
+            // 락 획득 계속 재시도
             while (true) {
                 ttl = tryAcquire(-1, leaseTime, unit, threadId);
                 // lock acquired
@@ -139,6 +139,7 @@ public class RedissonLock extends RedissonBaseLock {
                         entry.getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
                     }
                 } else {
+                    // 뭔가 잘못된 상황임. ttl < 0
                     if (interruptibly) {
                         entry.getLatch().acquire();
                     } else {
@@ -151,11 +152,18 @@ public class RedissonLock extends RedissonBaseLock {
         }
 //        get(lockAsync(leaseTime, unit));
     }
-    
+
+    // 락을 동기적으로 획득 시도함. 비동기 결과를 기다려서 최종 값(Long)을 반환함.
+    // 사용자 코드에서 tryLock() 시도하면 이 메서드가 호출됨
     private Long tryAcquire(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         return get(tryAcquireAsync0(waitTime, leaseTime, unit, threadId));
     }
-
+    /**
+     * 락 획득 비동기 작업을 실행하고, Redis 오류 발생 시 자동 재시도하는 메서드.
+     * 내부적으로 tryAcquireAsync(...)를 실행하고,
+     * 특정 Redis 오류("None of slaves were synced")가 발생하면 설정된 횟수만큼 재시도함.
+     * Redis 마스터-슬레이브 구조에서 동기화 지연에 대응하기 위한 안정성 확보용 래퍼.
+     */
     private RFuture<Long> tryAcquireAsync0(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         return getServiceManager().execute(() -> tryAcquireAsync(waitTime, leaseTime, unit, threadId));
     }
@@ -185,23 +193,29 @@ public class RedissonLock extends RedissonBaseLock {
         return new CompletableFutureWrapper<>(f);
     }
 
+    // 락을 비동기적으로 획득 시도함
+    // 성공 시 null 반환, 실패 시 남은 ttl 반환
     private RFuture<Long> tryAcquireAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         RFuture<Long> ttlRemainingFuture;
+        // Lua 스크립트로 락 획득 시도하는 부분, 획득성공->null, 실패->ttl(ms)
         if (leaseTime > 0) {
             ttlRemainingFuture = tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
         } else {
             ttlRemainingFuture = tryLockInnerAsync(waitTime, internalLockLeaseTime,
                     TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_LONG);
         }
+        // 락 획득 시도 중 특정 에러 상황 (슬레이브 동기화 실패 등) 발생 시, 자동으로 unlock 해주는 로직
         CompletionStage<Long> s = handleNoSync(threadId, ttlRemainingFuture);
         ttlRemainingFuture = new CompletableFutureWrapper<>(s);
 
         CompletionStage<Long> f = ttlRemainingFuture.thenApply(ttlRemaining -> {
-            // lock acquired
+            // lock acquired 락 획득했다면
             if (ttlRemaining == null) {
                 if (leaseTime > 0) {
+                    // 사용자가 지정한 leaseTime이 있으면 내부 ttl 갱신
                     internalLockLeaseTime = unit.toMillis(leaseTime);
                 } else {
+                    // 자동 연장 스케줄러 작동
                     scheduleExpirationRenewal(threadId);
                 }
             }
@@ -229,26 +243,33 @@ public class RedissonLock extends RedissonBaseLock {
 
     @Override
     public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) throws InterruptedException {
-        long time = unit.toMillis(waitTime);
+        long time = unit.toMillis(waitTime); // 전체 대기시간
         long current = System.currentTimeMillis();
         long threadId = Thread.currentThread().getId();
+        // 락을 동기적으로 획득 시도한다.
         Long ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
         // lock acquired
         if (ttl == null) {
             return true;
         }
-        
+        // tryAcquire 실행에 걸린 시간(락 시도 시간)을 계산하고, 전체 대기시간에서 차감한다.
         time -= System.currentTimeMillis() - current;
         if (time <= 0) {
+            // 대기 시간이 초과됐을 경우
             acquireFailed(waitTime, unit, threadId);
             return false;
         }
         
         current = System.currentTimeMillis();
+        // 락 점유중인 스레드의 unlock()으로부터 publish 메시지를 받기 위해, pubsub 채널을 구독하여 락 해제 메시지를 대기 준비한다.
+        // RedissonLockEntry: 락 상태를 관리하는 객체로, 내부에 Semapore를 포함한다.
+        // 구독 실패하면 acquireFailed()를 호출한다.
         CompletableFuture<RedissonLockEntry> subscribeFuture = subscribe(threadId);
         try {
+            // 지정된 시간동안 구독 완료를 대기한다.
             subscribeFuture.get(time, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
+            // 제한된 시간동안 구독하지 못하면 타임아웃 exception 발생
             if (!subscribeFuture.completeExceptionally(new RedisTimeoutException(
                     "Unable to acquire subscription lock after " + time + "ms. " +
                             "Try to increase 'subscriptionsPerConnection' and/or 'subscriptionConnectionPoolSize' parameters."))) {
@@ -267,20 +288,25 @@ public class RedissonLock extends RedissonBaseLock {
         }
 
         try {
+            // 초기 대기 시간 갱신: 구독에 걸린 시간 계산 -> time
             time -= System.currentTimeMillis() - current;
             if (time <= 0) {
+                // 타임아웃
                 acquireFailed(waitTime, unit, threadId);
                 return false;
             }
-        
+
+            // 락 재시도 루프 진입
             while (true) {
                 long currentTime = System.currentTimeMillis();
+                // 락 재시도
                 ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
                 // lock acquired
                 if (ttl == null) {
                     return true;
                 }
 
+                // 락 재시도 시간 빼서 대기 시간 갱신
                 time -= System.currentTimeMillis() - currentTime;
                 if (time <= 0) {
                     acquireFailed(waitTime, unit, threadId);
@@ -290,8 +316,12 @@ public class RedissonLock extends RedissonBaseLock {
                 // waiting for message
                 currentTime = System.currentTimeMillis();
                 if (ttl >= 0 && ttl < time) {
-                    commandExecutor.getNow(subscribeFuture).getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
+                    // RedissonLockEntry의 Semaphore를 통해 락 해제 메시지를 대기한다.
+                    // 남은 ttl이 남은 대기 시간보다 짧으면 ttl 만큼 대기
+                    // Semaphore 객체를 통해 tryAcquire 메서드 호출
+                    commandExecutor.getNow(subscribeFuture).getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS); //
                 } else {
+                    // 아니면 time 만큼 대기
                     commandExecutor.getNow(subscribeFuture).getLatch().tryAcquire(time, TimeUnit.MILLISECONDS);
                 }
 
@@ -302,6 +332,7 @@ public class RedissonLock extends RedissonBaseLock {
                 }
             }
         } finally {
+            // 구독 해제
             unsubscribe(commandExecutor.getNow(subscribeFuture), threadId);
         }
 //        return get(tryLockAsync(waitTime, leaseTime, unit));
@@ -343,28 +374,32 @@ public class RedissonLock extends RedissonBaseLock {
 
     protected RFuture<Boolean> unlockInnerAsync(long threadId, String requestId, int timeout) {
         return evalWriteSyncedNoRetryAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
-                              "local val = redis.call('get', KEYS[3]); " +
-                                    "if val ~= false then " +
-                                        "return tonumber(val);" +
-                                    "end; " +
+                // getUnlockLatchName(requestId) 키 값 확인 -> 저장돼 있으면 값 반환
+                "local val = redis.call('get', KEYS[3]); " +
+                "if val ~= false then " +
+                    "return tonumber(val);" +
+                "end; " +
 
-                                    "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +
-                                        "return nil;" +
-                                    "end; " +
-                                    "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " +
-                                    "if (counter > 0) then " +
-                                        "redis.call('pexpire', KEYS[1], ARGV[2]); " +
-                                        "redis.call('set', KEYS[3], 0, 'px', ARGV[5]); " +
-                                        "return 0; " +
-                                    "else " +
-                                        "redis.call('del', KEYS[1]); " +
-                                        "redis.call(ARGV[4], KEYS[2], ARGV[1]); " +
-                                        "redis.call('set', KEYS[3], 1, 'px', ARGV[5]); " +
-                                        "return 1; " +
-                                    "end; ",
-                                Arrays.asList(getRawName(), getChannelName(), getUnlockLatchName(requestId)),
-                                LockPubSub.UNLOCK_MESSAGE, internalLockLeaseTime,
-                                getLockName(threadId), getSubscribeService().getPublishCommand(), timeout);
+                  // 현재 스레드가 락 보유하고 있지 않으면 -> return null
+                "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +
+                    "return nil;" +
+                "end; " +
+                "local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1); " +
+                  // 락을 여러 개 보유하고 있었을 경우
+                "if (counter > 0) then " +
+                    "redis.call('pexpire', KEYS[1], ARGV[2]); " +
+                    "redis.call('set', KEYS[3], 0, 'px', ARGV[5]); " + // UnlockLatch 키 0 저장
+                    "return 0; " + // 락이 완전히 해제되지 않았음을 의미 -> false로 변환됨
+                  // 마지막 락 해제
+                "else " +
+                    "redis.call('del', KEYS[1]); " + // 락 삭제(DEL 락이름)
+                    "redis.call(ARGV[4], KEYS[2], ARGV[1]); " + // PUBLISH currentChannel UNLOCK_MESSAGE
+                    "redis.call('set', KEYS[3], 1, 'px', ARGV[5]); " +
+                    "return 1; " + // 락이 완전히 해제되었음을 의미 -> true
+                "end; ",
+            Arrays.asList(getRawName(), getChannelName(), getUnlockLatchName(requestId)),
+            LockPubSub.UNLOCK_MESSAGE, internalLockLeaseTime,
+            getLockName(threadId), getSubscribeService().getPublishCommand(), timeout);
     }
 
     @Override
