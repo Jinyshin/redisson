@@ -560,6 +560,7 @@ public final class ServiceManager {
         });
     }
 
+    // 특정 횟수만큼(3회) 재시도하게 하는 함수 -> 내부 execute를 통해 정해진 반환값을 return
     public <T> RFuture<T> execute(Supplier<CompletionStage<T>> supplier) {
         CompletableFuture<T> result = new CompletableFuture<>();
         int retryAttempts = config.getRetryAttempts();
@@ -568,18 +569,23 @@ public final class ServiceManager {
         return new CompletableFutureWrapper<>(result);
     }
 
+    // 비동기 작업을 실행하고, 결과를 result에 설정해주기 위한 메서드.
     private <T> void execute(AtomicInteger attempts, CompletableFuture<T> result, Supplier<CompletionStage<T>> supplier) {
+        // supplier 를 호출해서 비동기 작업 시작
         CompletionStage<T> future = supplier.get();
         future.whenComplete((r, e) -> {
             if (e != null) {
+                // 특정 조건 만족하는 경우에만 재시도
                 if (e.getCause() != null
                         && e.getCause().getMessage() != null
                             && e.getCause().getMessage().equals("None of slaves were synced")) {
+                    // 재시도 횟수를 다 소진한 경우 예외 반환
                     if (attempts.decrementAndGet() < 0) {
                         result.completeExceptionally(e);
                         return;
                     }
 
+                    // 지정된 재시도 간격 이후 재실행
                     newTimeout(t -> execute(attempts, result, supplier),
                             config.getRetryInterval(), TimeUnit.MILLISECONDS);
                     return;
@@ -589,6 +595,7 @@ public final class ServiceManager {
                 return;
             }
 
+            // 정상 결과 반환
             result.complete(r);
         });
     }

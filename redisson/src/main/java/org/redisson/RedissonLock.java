@@ -156,6 +156,8 @@ public class RedissonLock extends RedissonBaseLock {
     // 락을 동기적으로 획득 시도함. 비동기 결과를 기다려서 최종 값(Long)을 반환함.
     // 사용자 코드에서 tryLock() 시도하면 이 메서드가 호출됨
     private Long tryAcquire(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
+        // 이렇게 하거나, 아니면 tryAcquireAsync0를 RFuture 자료형의 어떤 변수에 담고, get()을 호출해서 사용하는 것도 똑같음.
+        // 그니까 비동기 함수의 반환형은 RFuture가 되는데, 이걸 get으로 기다려주는 것.
         return get(tryAcquireAsync0(waitTime, leaseTime, unit, threadId));
     }
     /**
@@ -229,7 +231,8 @@ public class RedissonLock extends RedissonBaseLock {
         return get(tryLockAsync());
     }
 
-    <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
+    // 실제 Redis에 락을 저장하는 로직
+    <T> RFuture<T>  tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
         return evalWriteSyncedNoRetryAsync(getRawName(), LongCodec.INSTANCE, command,
                 "if ((redis.call('exists', KEYS[1]) == 0) " +
                             "or (redis.call('hexists', KEYS[1], ARGV[2]) == 1)) then " +
@@ -318,6 +321,8 @@ public class RedissonLock extends RedissonBaseLock {
                 if (ttl >= 0 && ttl < time) {
                     // RedissonLockEntry의 Semaphore를 통해 락 해제 메시지를 대기한다.
                     // 남은 ttl이 남은 대기 시간보다 짧으면 ttl 만큼 대기
+                        // 왜 이렇게 하냐면, ttl이 끝나면 락이 해제된다는게 보장되어 있으니, ttl 만큼의 실행시간 이후에 바로 다시 시도해보겠다는 것.
+                    //      && ttl이 남은 대기시간보다 길면, 애초에 기다리기로 한 만큼의 시간만 일단 기다리고 다시 락획득을 재시도함
                     // Semaphore 객체를 통해 tryAcquire 메서드 호출
                     commandExecutor.getNow(subscribeFuture).getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS); //
                 } else {
