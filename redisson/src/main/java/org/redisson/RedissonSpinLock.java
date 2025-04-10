@@ -65,6 +65,7 @@ public final class RedissonSpinLock extends RedissonBaseLock {
         }
     }
 
+    // 호출 -> lockInterruptibly -> tryAcquire -> tryAcquireAsync -> tryInnerAsync
     @Override
     public void lock(long leaseTime, TimeUnit unit) {
         try {
@@ -111,6 +112,11 @@ public final class RedissonSpinLock extends RedissonBaseLock {
         CompletionStage<Long> s = handleNoSync(threadId, ttlRemainingFuture);
         ttlRemainingFuture = new CompletableFutureWrapper<>(s);
 
+        /*
+         * 이 코드의 필요성:
+         * leaseTime > 0일 때에는, 해당 시간만큼 락이 점유된 뒤, 해제되어야 함. 따라서 추가적인 작업 없이 바로 CompletableFutureWrapper 리턴.
+         * 하지만 leaseTime <= 0 경우에는, 해제 제한 시간이 없는 것이므로 점유 시간 자동 연장 로직을 추가해줘야 하기 때문에 필요함.
+         */
         ttlRemainingFuture.thenAccept(ttlRemaining -> {
             // lock acquired
             if (ttlRemaining == null) {
@@ -120,6 +126,9 @@ public final class RedissonSpinLock extends RedissonBaseLock {
         return ttlRemainingFuture;
     }
 
+    // 별도의 waitTime 없이 호출하는 함수
+    // 이 함수 호출 시 내부동작: 이 파일 #L260의 tryLockAsync(long threadId) 호출되고
+    // -> tryAcquireAsync -> 이 바로밑 tryLockInnerAsync 까지 호출됨.
     @Override
     public boolean tryLock() {
         return get(tryLockAsync());
