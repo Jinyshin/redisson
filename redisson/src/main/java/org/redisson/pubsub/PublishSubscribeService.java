@@ -489,6 +489,7 @@ public class PublishSubscribeService {
                     "Unable to acquire subscription lock after " + timeout + "ms. " +
                             "Try to increase 'subscriptionTimeout', 'subscriptionsPerConnection', 'subscriptionConnectionPoolSize' parameters. "));
         }, timeout, TimeUnit.MILLISECONDS);
+        // 타임아웃 전에 promise가 완료되면(정상 or 비정상으로) 타임아웃 작업이 실행되지 않도록 위 스케줄을 취소함
         promise.whenComplete((r, e) -> {
             task.cancel();
         });
