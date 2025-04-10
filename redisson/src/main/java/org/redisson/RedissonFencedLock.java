@@ -162,7 +162,8 @@ public class RedissonFencedLock extends RedissonLock implements RFencedLock {
                 return;
             }
 
-            Long ttl = res.get(0);
+            Long ttl = res.get(0); // 락 성공시 {-1, 펜싱토큰} 반환, 실패시 {pttl, -1} 반환
+            // 즉, ttl = -1 또는 남은 ttl 값
             // lock acquired
             if (ttl == -1) {
                 if (!result.complete(res.get(1))) {
@@ -171,9 +172,11 @@ public class RedissonFencedLock extends RedissonLock implements RFencedLock {
                 return;
             }
 
+            // 다른 스레드가 락을 소유하고 있는 경우(ttl != -1)
             long el = System.currentTimeMillis() - currentTime;
             time.addAndGet(-el);
 
+            // 만약 대기 시간 초과시 -> null 반환(락 획득 실패)
             if (time.get() <= 0) {
                 result.complete(null);
                 return;
@@ -181,8 +184,12 @@ public class RedissonFencedLock extends RedissonLock implements RFencedLock {
 
             long current = System.currentTimeMillis();
             AtomicReference<Timeout> futureRef = new AtomicReference<>();
+            // 락 시도 실패자들 구독 시작!
             CompletableFuture<RedissonLockEntry> subscribeFuture = subscribe(currentThreadId);
+            // 대기 시간 내에 구독 완료 안되면 취소함(타임아웃 설정).
             pubSub.timeout(subscribeFuture, time.get());
+
+            // 구독 완료 후 재시도
             subscribeFuture.whenComplete((r, ex) -> {
                 if (ex != null) {
                     result.completeExceptionally(ex);
@@ -196,8 +203,10 @@ public class RedissonFencedLock extends RedissonLock implements RFencedLock {
                 long elapsed = System.currentTimeMillis() - current;
                 time.addAndGet(-elapsed);
 
+                // 재시도 로직
                 tryLockAsync(time, waitTime, leaseTime, unit, r, result, currentThreadId);
             });
+            // 구독 완료 안될경우, 타임아웃 작업 실행 예약함. -> 구독 실패시 null 반환을 보장함.
             if (!subscribeFuture.isDone()) {
                 Timeout scheduledFuture = commandExecutor.getServiceManager().newTimeout(new TimerTask() {
                     @Override
@@ -218,39 +227,51 @@ public class RedissonFencedLock extends RedissonLock implements RFencedLock {
 
     private void tryLockAsync(AtomicLong time, long waitTime, long leaseTime, TimeUnit unit,
                               RedissonLockEntry entry, CompletableFuture<Long> result, long currentThreadId) {
+        // 결과가 이미 완료된 경우 -> 구독 해제 후 종료
         if (result.isDone()) {
             unsubscribe(entry, currentThreadId);
             return;
         }
 
+        // 대기 시간 초과된 경우 -> 구독 해제, null 반환 후 종료
         if (time.get() <= 0) {
             unsubscribe(entry, currentThreadId);
             result.complete(null);
             return;
         }
 
+        // 현재 시간 기록
         long curr = System.currentTimeMillis();
+        // 락 재시도 (다시 tryAcquireAsync 호출)
         RFuture<List<Long>> ttlFuture = tryAcquireAsync(waitTime, leaseTime, unit, currentThreadId);
+        // 재시도한 결과 처리
         ttlFuture.whenComplete((res, e) -> {
+            // 예외 발생시 처리: 구독 해제, result에 예외 전달하고 종료
             if (e != null) {
                 unsubscribe(entry, currentThreadId);
                 result.completeExceptionally(e);
                 return;
             }
 
+            // 락 획득 성공 여부 확인
             Long ttl = res.get(0);
             // lock acquired
+            // 락 획득 성공 -> ttl = -1 됨.
             if (ttl == -1) {
+                // 구독 해제
                 unsubscribe(entry, currentThreadId);
+                // result에 토큰 값으로 값을 채우는데, 실패하면 강제로 락 해지 - res[1]에 토큰 있어야함. complete()는 compareAndSet()임
                 if (!result.complete(res.get(1))) {
                     unlockAsync(currentThreadId);
                 }
                 return;
             }
 
+            // 락 획득 실패시
+            // 경과 시간 계산 및 반영
             long el = System.currentTimeMillis() - curr;
             time.addAndGet(-el);
-
+            // 대기 시간 초과 여부 확인
             if (time.get() <= 0) {
                 unsubscribe(entry, currentThreadId);
                 result.complete(null);
@@ -258,32 +279,45 @@ public class RedissonFencedLock extends RedissonLock implements RFencedLock {
             }
 
             // waiting for message
+            // 락 해제 알림 대기
+            // 현재 시간 다시 기록
             long current = System.currentTimeMillis();
+            // 지금 바로 락 재시도 가능한지 확인하는 로직 - 이게 true 라면, 락 해제 알림 와서 -> latch 허용량이 증가한 상태였다는 것.
             if (entry.getLatch().tryAcquire()) {
+                // 재시도 가능하면 바로 다시 tryLockAsync 재귀 호출!
                 tryLockAsync(time, waitTime, leaseTime, unit, entry, result, currentThreadId);
-            } else {
-                AtomicBoolean executed = new AtomicBoolean();
-                AtomicReference<Timeout> futureRef = new AtomicReference<>();
+            }
+            // 재시도 불가능하면 리스너 등록 후 알림 대기
+            else {
+                AtomicBoolean executed = new AtomicBoolean(); // 리스너가 실행됐는지 여부를 추적하는 플래그
+                AtomicReference<Timeout> futureRef = new AtomicReference<>(); // 타임아웃 작업을 추적하는 변수
+                // 리스너 정의
                 Runnable listener = () -> {
-                    executed.set(true);
+                    executed.set(true); // 리스너가 실행 완료됨 표시
                     if (futureRef.get() != null) {
+                        // 리스너가 먼저 실행됐으니 타임아웃으로 예약된 작업을 취소함
                         futureRef.get().cancel();
                     }
 
                     long elapsed = System.currentTimeMillis() - current;
-                    time.addAndGet(-elapsed);
+                    time.addAndGet(-elapsed); // 경과 시간 반영
 
                     tryLockAsync(time, waitTime, leaseTime, unit, entry, result, currentThreadId);
                 };
+                // 리스너 등록 -> latch의 허용량이 증가하면(즉, entry.getLatch().release() 호출 시) 등록된 listener를 실행되도록 함.
                 entry.addListener(listener);
 
+                // 남은 대기시간, ttl중 작은 값으로 타임아웃 시간 설정
                 long t = time.get();
                 if (ttl < time.get()) {
                     t = ttl;
                 }
-                if (!executed.get()) {
+                if (!executed.get()) { // executed.get() == true -> 리스너가 실행됐다는 뜻. == false -> 리스너가 아직 실행되지 않았다면, 이라는 뜻.
+                    // 아직 리스너가 실행되지 않았으니, t 만큼의 시간 후에 재시도를 예약한다는 의미.
+                        // 즉, 락 해제 알림이 안와도 t 시간 이후에 강제로 재시도하는 로직임. 이게 없으면 락이 풀렸는데->알림못받은경우 waitTime까지 기다려야만 함. <-이 상황을 방지하기 위한 것.
+                    // 리스너가 실행됐을 경우, 그 내부에서 tryLockAsync를 호출하므로 스케줄 생략.
                     Timeout scheduledFuture = commandExecutor.getServiceManager().newTimeout(timeout -> {
-                        if (entry.removeListener(listener)) {
+                        if (entry.removeListener(listener)) { // 타임아웃 로직 실행 이호 리스너를 제거해서 더이상 알림에 반응하지 않도록 한다.
                             long elapsed = System.currentTimeMillis() - current;
                             time.addAndGet(-elapsed);
 
